@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import subprocess, tempfile, os, sys, signal
+import subprocess, tempfile, os, sys, signal, re
 
 app = FastAPI()
 
@@ -25,39 +25,29 @@ def is_safe(code: str) -> tuple[bool, str]:
     return True, ""
 
 
-# ── Auto-prepend missing imports so partial code works ──
+# ── Auto-prepend imports so partial snippets run ──
+# Note: duplicate imports are harmless in Python (`import torch` twice never errors),
+# so we simply prepend the import for any usage pattern we detect. No fragile
+# "already imported?" checks needed — that was the source of the earlier bug.
 AUTO_IMPORTS = [
-    ("torch",       "import torch"),
-    ("torchvision", "import torchvision"),
-    ("torchaudio",  "import torchaudio"),
-    ("nn.",         "import torch.nn as nn"),
-    ("optim.",      "import torch.optim as optim"),
-    ("F.",          "import torch.nn.functional as F"),
-    ("np.",         "import numpy as np"),
-    ("pd.",         "import pandas as pd"),
-    ("plt.",        "import matplotlib.pyplot as plt"),
-    ("sns.",        "import seaborn as sns"),
+    (r"\btorch\b",       "import torch"),
+    (r"\btorchvision\b", "import torchvision"),
+    (r"\btorchaudio\b",  "import torchaudio"),
+    (r"\bnn\.",          "import torch.nn as nn"),
+    (r"\boptim\.",       "import torch.optim as optim"),
+    (r"\bF\.",           "import torch.nn.functional as F"),
+    (r"\bnp\.",          "import numpy as np"),
+    (r"\bpd\.",          "import pandas as pd"),
+    (r"\bplt\.",         "import matplotlib.pyplot as plt"),
 ]
 
 def add_missing_imports(code: str) -> str:
-    lines_to_add = []
-    for keyword, import_stmt in AUTO_IMPORTS:
-        # Skip if already imported
-        pkg = import_stmt.split()[-1].split(".")[0]
-        if keyword in code and pkg not in code.split("import ")[-1]:
-            # More precise check: keyword used but import line not present
-            already = any(
-                import_stmt.strip() in line or
-                f"import {pkg}" in line
-                for line in code.splitlines()
-            )
-            if not already:
-                lines_to_add.append(import_stmt)
-    if lines_to_add:
-        # Remove duplicates while preserving order
-        seen = set()
-        unique = [x for x in lines_to_add if not (x in seen or seen.add(x))]
-        return "\n".join(unique) + "\n\n" + code
+    prelude = []
+    for pattern, import_stmt in AUTO_IMPORTS:
+        if re.search(pattern, code):
+            prelude.append(import_stmt)
+    if prelude:
+        return "\n".join(prelude) + "\n\n" + code
     return code
 
 
