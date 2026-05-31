@@ -18,7 +18,7 @@ BLOCKED = [
     "__import__('os')", "open('/etc", "open('/proc",
 ]
 
-def is_safe(code: str) -> tuple[bool, str]:
+def is_safe(code: str):
     for b in BLOCKED:
         if b in code:
             return False, f"Blocked: '{b}' is not allowed for security."
@@ -26,9 +26,7 @@ def is_safe(code: str) -> tuple[bool, str]:
 
 
 # ── Auto-prepend imports so partial snippets run ──
-# Note: duplicate imports are harmless in Python (`import torch` twice never errors),
-# so we simply prepend the import for any usage pattern we detect. No fragile
-# "already imported?" checks needed — that was the source of the earlier bug.
+# Duplicate imports are harmless in Python, so we just prepend on detection.
 AUTO_IMPORTS = [
     (r"\btorch\b",       "import torch"),
     (r"\btorchvision\b", "import torchvision"),
@@ -38,22 +36,61 @@ AUTO_IMPORTS = [
     (r"\bF\.",           "import torch.nn.functional as F"),
     (r"\bnp\.",          "import numpy as np"),
     (r"\bpd\.",          "import pandas as pd"),
-    (r"\bplt\.",         "import matplotlib.pyplot as plt"),
 ]
 
-def add_missing_imports(code: str) -> str:
+# matplotlib needs the headless AGG backend set BEFORE pyplot is imported.
+MPL_PRELUDE = (
+    "import matplotlib\n"
+    "matplotlib.use('AGG')\n"
+    "import matplotlib.pyplot as plt\n"
+    "plt.show = lambda *a, **k: None\n"
+)
+
+# After user code runs, capture any open figures as base64 PNGs.
+# The frontend splits on '__PG_IMG__' to render them inline.
+PLOT_CAPTURE = (
+    "\n\n# __auto_plot_capture__\n"
+    "try:\n"
+    "    import sys as __s\n"
+    "    if 'matplotlib' in __s.modules:\n"
+    "        import io as __io, base64 as __b64\n"
+    "        import matplotlib.pyplot as __plt\n"
+    "        for __n in __plt.get_fignums():\n"
+    "            __f = __plt.figure(__n)\n"
+    "            __buf = __io.BytesIO()\n"
+    "            __f.savefig(__buf, format='png', bbox_inches='tight', dpi=92)\n"
+    "            __buf.seek(0)\n"
+    "            print('__PG_IMG__data:image/png;base64,' + __b64.b64encode(__buf.getvalue()).decode())\n"
+    "        __plt.close('all')\n"
+    "except Exception:\n"
+    "    pass\n"
+)
+
+def prepare_code(code: str) -> str:
     prelude = []
     for pattern, import_stmt in AUTO_IMPORTS:
         if re.search(pattern, code):
             prelude.append(import_stmt)
+    uses_mpl = re.search(r"\b(plt|pyplot|matplotlib)\b", code)
+    head = ""
+    if uses_mpl:
+        head += MPL_PRELUDE
     if prelude:
-        return "\n".join(prelude) + "\n\n" + code
-    return code
+        head += "\n".join(prelude) + "\n"
+    body = (head + "\n" + code) if head else code
+    if uses_mpl:
+        body += PLOT_CAPTURE
+    return body
 
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "ML Runner API — Python with PyTorch"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
 
 
 @app.post("/run")
@@ -68,8 +105,8 @@ async def run_code(request: Request):
     if not safe:
         return JSONResponse({"output": "", "error": reason})
 
-    # Auto-add missing imports (torch, np, pd, plt etc.)
-    code = add_missing_imports(code)
+    # Auto-add imports + matplotlib headless setup + figure capture
+    code = prepare_code(code)
 
     # Write code to a temp file and execute
     with tempfile.NamedTemporaryFile(
@@ -86,17 +123,16 @@ async def run_code(request: Request):
             timeout=20,
             env={
                 **os.environ,
-                "MPLBACKEND": "Agg",          # matplotlib non-interactive
+                "MPLBACKEND": "Agg",
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
         )
         output = result.stdout or ""
-        error  = result.stderr or ""
+        error = result.stderr or ""
 
-        # Strip long tracebacks to just the useful part
+        # Trim very long tracebacks to the useful tail
         if error and len(error) > 2000:
-            lines = error.splitlines()
-            error = "\n".join(lines[-20:])
+            error = "\n".join(error.splitlines()[-20:])
 
         return JSONResponse({"output": output, "error": error})
 
@@ -109,8 +145,3 @@ async def run_code(request: Request):
             os.unlink(fname)
         except Exception:
             pass
-
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
